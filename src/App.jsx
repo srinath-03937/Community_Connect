@@ -132,14 +132,23 @@ const App = () => {
   const [showWorkerDirectory, setShowWorkerDirectory] = useState(false);
   const [adminPasswordChange, setAdminPasswordChange] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [showPasswordChangeModal, setShowPasswordChangeModal] = useState(false);
+  const [showRatingModal, setShowRatingModal] = useState(false);
+  const [selectedWorkerForRating, setSelectedWorkerForRating] = useState(null);
+  const [userRating, setUserRating] = useState(0);
+  const [ratingComment, setRatingComment] = useState('');
   const mapRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  const { isLoaded } = useJsApiLoader({
+  const { isLoaded, loadError } = useJsApiLoader({
     id: 'google-map-script',
     googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_API_KEY || 'AIzaSyBFw0Qbyq0zq5hWdHYhKjqLH7hB0hBKVUQ',
     libraries
   });
+
+  // Handle Google Maps loading error
+  if (loadError) {
+    console.warn('Google Maps failed to load. Using fallback map.');
+  }
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -340,6 +349,121 @@ const App = () => {
     });
   };
 
+  const handleUserRating = async () => {
+    if (!selectedWorkerForRating || userRating === 0) {
+      alert('Please select a rating');
+      return;
+    }
+    
+    try {
+      // Add user rating to ratings collection
+      await addDoc(collection(db, 'userRatings'), {
+        workerId: selectedWorkerForRating.id,
+        workerEmail: selectedWorkerForRating.email || selectedWorkerForRating.contactNumber || 'unknown',
+        rating: userRating,
+        comment: ratingComment,
+        ratedBy: user?.email || 'anonymous',
+        reportId: selectedReport?.id || null,
+        createdAt: new Date()
+      });
+      
+      // Update worker's average rating
+      await updateWorkerAverageRating(selectedWorkerForRating.id);
+      
+      // Reset form
+      setShowRatingModal(false);
+      setSelectedWorkerForRating(null);
+      setUserRating(0);
+      setRatingComment('');
+      
+      alert('Thank you for rating the worker!');
+    } catch (error) {
+      console.error('Error submitting rating:', error);
+      alert('Failed to submit rating');
+    }
+  };
+
+  const updateWorkerAverageRating = async (workerId) => {
+    try {
+      const ratingsSnapshot = await getDocs(query(collection(db, 'userRatings'), where('workerId', '==', workerId)));
+      const ratings = ratingsSnapshot.docs.map(doc => doc.data());
+      
+      if (ratings.length > 0) {
+        const averageRating = ratings.reduce((sum, rating) => sum + rating.rating, 0) / ratings.length;
+        const workerRef = doc(db, 'workers', workerId);
+        
+        await updateDoc(workerRef, {
+          userRating: Math.round(averageRating * 10) / 10, // Round to 1 decimal
+          totalRatings: ratings.length
+        });
+      }
+      
+      fetchWorkers(); // Refresh workers data
+    } catch (error) {
+      console.error('Error updating worker average rating:', error);
+    }
+  };
+
+  const openRatingModal = (worker) => {
+    setSelectedWorkerForRating(worker);
+    setShowRatingModal(true);
+    setUserRating(0);
+    setRatingComment('');
+  };
+
+  const calculateWorkerRating = (completedReports, assignedReports) => {
+    if (assignedReports === 0) return 0;
+    
+    const completionRate = completedReports / assignedReports;
+    
+    // Rating based on completion rate
+    if (completionRate >= 0.95) return 5;
+    if (completionRate >= 0.85) return 4;
+    if (completionRate >= 0.75) return 3;
+    if (completionRate >= 0.60) return 2;
+    if (completionRate >= 0.40) return 1;
+    return 0;
+  };
+
+  const handleBrowseReports = () => {
+    // Set state to show all reports in a browseable format
+    setActiveTab('reports');
+    setShowPublicPortal(false);
+  };
+
+  const updateWorkerRatingOnAssignment = async (workerId) => {
+    try {
+      const workerSnapshot = await getDocs(query(collection(db, 'workers'), where('id', '==', workerId)));
+      if (!workerSnapshot.empty) {
+        const workerData = workerSnapshot.docs[0].data();
+        const workerRef = doc(db, 'workers', workerId);
+        
+        // Update rating based on current performance
+        const newRating = calculateWorkerRating(
+          workerData.completedReports || 0, 
+          (workerData.assignedReports || 0) + 1 // Include this new assignment
+        );
+        
+        await updateDoc(workerRef, {
+          rating: newRating
+        });
+      }
+    } catch (error) {
+      console.error('Error updating worker rating on assignment:', error);
+    }
+  };
+
+  // Fallback map component
+  const FallbackMap = () => (
+    <div className="bg-gray-200 rounded-lg flex items-center justify-center" style={{ height: '400px' }}>
+      <div className="text-center p-4">
+        <MapPin className="h-12 w-12 text-gray-400 mx-auto mb-2" />
+        <p className="text-gray-600">Map unavailable</p>
+        <p className="text-sm text-gray-500">Location: {formData.address || 'Not specified'}</p>
+      </div>
+    </div>
+  );
+
   const exportToCSV = () => {
     const csvContent = [
       ['Title', 'Description', 'Category', 'Status', 'Priority', 'Address', 'Reporter', 'Date'],
@@ -373,13 +497,17 @@ const App = () => {
         updatedAt: new Date()
       });
       
-      // Update worker's assigned reports count
+      // Update worker's assigned reports count and rating
       const workerRef = doc(db, 'workers', workerId);
       const workerSnapshot = await getDocs(query(collection(db, 'workers'), where('id', '==', workerId)));
       if (!workerSnapshot.empty) {
         const workerData = workerSnapshot.docs[0].data();
+        const newAssignedReports = (workerData.assignedReports || 0) + 1;
+        const newRating = calculateWorkerRating(workerData.completedReports || 0, newAssignedReports);
+        
         await updateDoc(workerRef, {
-          assignedReports: (workerData.assignedReports || 0) + 1
+          assignedReports: newAssignedReports,
+          rating: newRating
         });
       }
       
@@ -391,21 +519,28 @@ const App = () => {
     }
   };
 
+  const clearChat = () => {
+    setChatbotMessages([
+      { id: Date.now(), text: "Hello! I'm your AI assistant. I can help with Community Connect and answer general questions. What would you like to know?", sender: 'bot', timestamp: new Date() }
+    ]);
+  };
+
   const handleChatbotSubmit = () => {
     if (chatbotInput.trim()) {
+      const newId = Date.now(); // Use timestamp for unique IDs
       const userMessage = {
-        id: chatbotMessages.length + 1,
+        id: newId,
         text: chatbotInput,
         sender: 'user',
         timestamp: new Date()
       };
       
-      setChatbotMessages([...chatbotMessages, userMessage]);
+      setChatbotMessages(prev => [...prev, userMessage]);
       
       // Simulate AI response
       setTimeout(() => {
         const botResponse = {
-          id: chatbotMessages.length + 2,
+          id: newId + 1, // Ensure unique ID
           text: getBotResponse(chatbotInput),
           sender: 'bot',
           timestamp: new Date()
@@ -420,19 +555,229 @@ const App = () => {
   const getBotResponse = (userInput) => {
     const input = userInput.toLowerCase();
     
-    if (input.includes('hello') || input.includes('hi')) {
-      return 'Hello! How can I help you with Community Connect today?';
-    } else if (input.includes('report')) {
-      return 'You can submit a report by clicking the "Submit Issue" button in the Public Portal or Home section.';
-    } else if (input.includes('status')) {
-      return 'You can check the status of your reports in the Reports tab or Worker Portal if you\'re a worker.';
-    } else if (input.includes('admin')) {
-      return 'Admin features are available to users with admin or manager roles. Contact your system administrator for access.';
-    } else if (input.includes('help')) {
-      return 'I can help you with: submitting reports, checking status, navigating the portal, and finding information. What do you need help with?';
-    } else {
-      return 'I understand you need assistance. You can try asking about reports, status, admin features, or navigation. How can I help?';
+    // Greeting responses
+    if (input.includes('hello') || input.includes('hi') || input.includes('hey')) {
+      const greetings = [
+        'Hello! I\'m your AI assistant. I can help with Community Connect and answer general questions. What would you like to know?',
+        'Hi there! I can assist you with both Community Connect features and general knowledge. How can I help?',
+        'Hey! I\'m here to help with community issues and answer any questions you might have. What\'s on your mind?'
+      ];
+      return greetings[Math.floor(Math.random() * greetings.length)];
     }
+    
+    // Technology and Science
+    if (input.includes('technology') || input.includes('tech') || input.includes('computer') || input.includes('software')) {
+      if (input.includes('ai') || input.includes('artificial intelligence')) {
+        return 'Artificial Intelligence is a field of computer science focused on creating systems that can perform tasks that typically require human intelligence. It includes machine learning, natural language processing, computer vision, and more. Modern AI powers everything from virtual assistants to self-driving cars.';
+      } else if (input.includes('programming') || input.includes('coding')) {
+        return 'Programming is the process of creating instructions for computers to execute. Popular languages include Python, JavaScript, Java, and C++. Learning to code opens up career opportunities in web development, data science, AI, and software engineering.';
+      } else if (input.includes('internet')) {
+        return 'The Internet is a global network of interconnected computers that communicate using standard protocols. It enables services like email, web browsing, social media, and streaming. The World Wide Web is one of the services that runs on the Internet.';
+      }
+      return 'Technology encompasses tools, systems, and methods that solve problems or improve efficiency. It includes everything from simple machines to advanced AI systems. What specific aspect of technology interests you?';
+    }
+    
+    // Science and Nature
+    if (input.includes('science') || input.includes('nature') || input.includes('environment')) {
+      if (input.includes('climate') || input.includes('global warming')) {
+        return 'Climate change refers to long-term shifts in global temperatures and weather patterns. It\'s primarily caused by human activities, particularly greenhouse gas emissions. Solutions include renewable energy, conservation, and sustainable practices.';
+      } else if (input.includes('space') || input.includes('astronomy')) {
+        return 'Space exploration has revealed incredible discoveries about our universe. From the Moon landing to Mars rovers and the James Webb Space Telescope, we continue to expand our understanding of planets, stars, galaxies, and the possibility of life beyond Earth.';
+      } else if (input.includes('biology') || input.includes('life')) {
+        return 'Biology is the study of living organisms and their interactions. It encompasses everything from microscopic bacteria to complex ecosystems. Understanding biology helps us appreciate biodiversity, develop medicines, and address environmental challenges.';
+      }
+      return 'Science helps us understand the natural world through observation and experimentation. It includes physics, chemistry, biology, and many other fields that explain how our universe works.';
+    }
+    
+    // Health and Wellness
+    if (input.includes('health') || input.includes('fitness') || input.includes('exercise') || input.includes('diet')) {
+      if (input.includes('mental health') || input.includes('stress') || input.includes('anxiety')) {
+        return 'Mental health is crucial for overall well-being. Practices like mindfulness, regular exercise, adequate sleep, and seeking support when needed can help manage stress and anxiety. Remember, it\'s important to prioritize mental health just like physical health.';
+      } else if (input.includes('exercise') || input.includes('workout')) {
+        return 'Regular exercise offers numerous benefits including improved cardiovascular health, stronger muscles and bones, better mood, and increased energy. Aim for at least 150 minutes of moderate activity per week, including both cardio and strength training.';
+      } else if (input.includes('nutrition') || input.includes('diet') || input.includes('food')) {
+        return 'Good nutrition involves eating a balanced diet with fruits, vegetables, whole grains, lean proteins, and healthy fats. Staying hydrated and limiting processed foods supports overall health. Consult healthcare professionals for personalized dietary advice.';
+      }
+      return 'Health encompasses physical, mental, and social well-being. Regular exercise, balanced nutrition, adequate sleep, and stress management are key components of a healthy lifestyle.';
+    }
+    
+    // Education and Learning
+    if (input.includes('education') || input.includes('learning') || input.includes('study') || input.includes('school')) {
+      if (input.includes('online learning') || input.includes('e-learning')) {
+        return 'Online learning offers flexibility and accessibility to education from anywhere. Platforms like Coursera, edX, and Khan Academy provide courses on various subjects. It requires self-discipline but can be very effective for skill development.';
+      } else if (input.includes('languages') || input.includes('language learning')) {
+        return 'Learning new languages enhances cognitive abilities, cultural understanding, and career opportunities. Popular methods include apps like Duolingo, immersion programs, and practice with native speakers. Consistency is key to language acquisition.';
+      }
+      return 'Education is a lifelong journey of acquiring knowledge and skills. It happens in formal settings like schools and universities, as well as through self-study, online courses, and real-world experiences.';
+    }
+    
+    // Business and Career
+    if (input.includes('business') || input.includes('career') || input.includes('job') || input.includes('work')) {
+      if (input.includes('entrepreneurship') || input.includes('startup')) {
+        return 'Entrepreneurship involves creating and managing businesses to solve problems or meet needs. It requires innovation, risk-taking, and resilience. Key elements include market research, business planning, funding, and continuous adaptation.';
+      } else if (input.includes('leadership') || input.includes('management')) {
+        return 'Effective leadership involves inspiring and guiding teams toward common goals. Key skills include communication, decision-making, empathy, and strategic thinking. Good leaders create positive work environments and foster growth.';
+      }
+      return 'Business involves creating value through products, services, or solutions. Career development requires continuous learning, networking, and adapting to changing market demands.';
+    }
+    
+    // Arts and Culture
+    if (input.includes('art') || input.includes('music') || input.includes('culture') || input.includes('entertainment')) {
+      if (input.includes('music') || input.includes('songs')) {
+        return 'Music is a universal art form that transcends cultural boundaries. It encompasses various genres, instruments, and traditions. Music can evoke emotions, tell stories, and bring people together across different backgrounds.';
+      } else if (input.includes('movies') || input.includes('films') || input.includes('cinema')) {
+        return 'Cinema combines visual storytelling, sound, and performance to create immersive experiences. Films entertain, educate, and provoke thought while reflecting and shaping cultural values and social issues.';
+      }
+      return 'Arts and culture express human creativity and reflect societal values. They include visual arts, performing arts, literature, music, and various cultural traditions that enrich our lives.';
+    }
+    
+    // History and Geography
+    if (input.includes('history') || input.includes('historical') || input.includes('geography') || input.includes('countries')) {
+      if (input.includes('world war') || input.includes('wwii')) {
+        return 'World War II (1939-1945) was a global conflict that reshaped the modern world. It led to significant political, social, and technological changes, including the formation of the United Nations and the beginning of the Cold War era.';
+      } else if (input.includes('ancient') || input.includes('rome') || input.includes('egypt')) {
+        return 'Ancient civilizations laid foundations for modern society. Roman law and engineering, Egyptian mathematics and architecture, and Greek philosophy continue to influence contemporary culture, governance, and knowledge.';
+      }
+      return 'History helps us understand past events and their impact on present society. Geography studies physical features, climate, and human activity across different regions of our planet.';
+    }
+    
+    // Mathematics and Logic
+    if (input.includes('math') || input.includes('mathematics') || input.includes('numbers') || input.includes('logic')) {
+      if (input.includes('algebra') || input.includes('calculus')) {
+        return 'Mathematics is the language of patterns and relationships. Algebra deals with equations and variables, while calculus studies change and motion. These fields are essential for science, engineering, economics, and data analysis.';
+      } else if (input.includes('statistics') || input.includes('data')) {
+        return 'Statistics involves collecting, analyzing, and interpreting data to make informed decisions. It\'s crucial in research, business, healthcare, and policy-making. Understanding statistics helps us evaluate claims and make evidence-based choices.';
+      }
+      return 'Mathematics provides tools for understanding patterns, solving problems, and making logical deductions. It\'s fundamental to science, technology, and everyday decision-making.';
+    }
+    
+    // Philosophy and Ethics
+    if (input.includes('philosophy') || input.includes('ethics') || input.includes('morality') || input.includes('meaning')) {
+      return 'Philosophy explores fundamental questions about existence, knowledge, values, and reason. Ethics examines moral principles and how we should live. These fields help us think critically about life\'s big questions and make thoughtful decisions.';
+    }
+    
+    // Current Events and News
+    if (input.includes('news') || input.includes('current events') || input.includes('politics')) {
+      return 'I can provide general information about topics and concepts, but for the very latest news and current events, I recommend checking reliable news sources. I can help explain political concepts, historical context, or discuss general civic topics.';
+    }
+    
+    // Personal Development
+    if (input.includes('productivity') || input.includes('goals') || input.includes('motivation') || input.includes('habits')) {
+      if (input.includes('time management')) {
+        return 'Effective time management involves prioritizing tasks, setting realistic goals, minimizing distractions, and maintaining work-life balance. Techniques like the Pomodoro method, time blocking, and regular breaks can improve productivity.';
+      } else if (input.includes('goals') || input.includes('planning')) {
+        return 'Setting SMART goals (Specific, Measurable, Achievable, Relevant, Time-bound) helps create clear direction. Breaking large goals into smaller steps and tracking progress maintains motivation and leads to success.';
+      }
+      return 'Personal development involves continuous learning and self-improvement. Key areas include emotional intelligence, communication skills, time management, and maintaining healthy habits.';
+    }
+    
+    // Travel and Exploration
+    if (input.includes('travel') || input.includes('tourism') || input.includes('countries') || input.includes('cities')) {
+      return 'Travel broadens perspectives by exposing us to different cultures, landscapes, and ways of life. It fosters cultural understanding, creates memorable experiences, and can be both educational and transformative. Always research destinations and respect local customs when traveling.';
+    }
+    
+    // Food and Cooking
+    if (input.includes('food') || input.includes('cooking') || input.includes('recipes') || input.includes('cuisine')) {
+      return 'Cooking is both a practical skill and creative art. Different cuisines reflect cultural traditions and local ingredients. Learning basic cooking techniques, understanding flavors, and experimenting with recipes can lead to delicious and nutritious meals.';
+    }
+    
+    // Sports and Recreation
+    if (input.includes('sports') || input.includes('games') || input.includes('exercise') || input.includes('fitness')) {
+      return 'Sports promote physical health, teamwork, and discipline. From team sports like soccer and basketball to individual activities like running and swimming, regular physical activity benefits both body and mind while fostering social connections.';
+    }
+    
+    // Community Connect specific responses (keep existing functionality)
+    if (input.includes('community connect') || input.includes('this app') || input.includes('portal')) {
+      if (input.includes('report') || input.includes('issue')) {
+        if (input.includes('submit') || input.includes('create') || input.includes('new')) {
+          return 'To submit a new report in Community Connect, click the "Submit Issue" button on the home page. You\'ll need to provide a title, description, and location for the community issue.';
+        } else if (input.includes('my') || input.includes('my reports')) {
+          const userReports = reports.filter(r => user && r.reporterEmail === user.email);
+          if (userReports.length > 0) {
+            return `You have ${userReports.length} report(s) in Community Connect. ${userReports.filter(r => r.status === 'pending').length} are pending, ${userReports.filter(r => r.status === 'resolved').length} are resolved. You can view them in the Reports tab.`;
+          } else {
+            return 'You haven\'t submitted any reports yet in Community Connect. Click "Submit Issue" to report a community problem.';
+          }
+        } else if (input.includes('total') || input.includes('how many')) {
+          return `There are currently ${reports.length} total reports in Community Connect. ${analytics.pendingReports} are pending, ${analytics.resolvedReports} are resolved, and ${analytics.inProgressReports} are in progress.`;
+        }
+        return 'In Community Connect, you can submit reports by clicking "Submit Issue" or view existing reports in the Reports tab. What specific help do you need with reports?';
+      } else if (input.includes('status')) {
+        if (input.includes('my') && user) {
+          const userReports = reports.filter(r => r.reporterEmail === user.email);
+          if (userReports.length > 0) {
+            const latestReport = userReports[0];
+            return `Your latest Community Connect report "${latestReport.title}" is currently ${latestReport.status}. You can view all your reports in the Reports tab.`;
+          }
+          return 'You haven\'t submitted any reports to Community Connect yet.';
+        }
+        return 'You can check Community Connect report status in the Reports tab. Reports can be pending, in-progress, or resolved.';
+      } else if (input.includes('statistics') || input.includes('analytics') || input.includes('data')) {
+        return `Community Connect statistics: ${analytics.totalReports} total reports, ${analytics.resolvedReports} resolved (${analytics.totalReports > 0 ? Math.round((analytics.resolvedReports/analytics.totalReports)*100) : 0}% resolution rate), ${analytics.pendingReports} pending. Average resolution time is ${analytics.averageResolutionTime.toFixed(1)} days.`;
+      } else if (input.includes('worker') || input.includes('work')) {
+        if (input.includes('become') || input.includes('join')) {
+          return 'Workers can register in Community Connect\'s Worker Portal. You\'ll need to provide your name, work type, and contact information to get started.';
+        }
+        return `Community Connect has ${workers.length} workers registered. Workers can be assigned to reports and mark them as resolved when completed.`;
+      } else if (input.includes('admin')) {
+        return 'Community Connect admin features include managing users, viewing all reports, assigning workers, and system analytics. Admin access is restricted to authorized users.';
+      }
+      return 'Community Connect is a platform for community issue reporting and management. I can help you with submitting reports, checking status, understanding features, or answer general questions. What would you like to know?';
+    }
+    
+    // Weather and Environment
+    if (input.includes('weather') || input.includes('climate') || input.includes('temperature')) {
+      return 'Weather refers to short-term atmospheric conditions including temperature, precipitation, wind, and humidity. Climate describes long-term weather patterns in a region. Understanding weather helps with daily planning, while climate knowledge addresses environmental challenges.';
+    }
+    
+    // General knowledge and help
+    if (input.includes('help') || input.includes('what can you do') || input.includes('capabilities')) {
+      return `I can help you with:\n\n**Community Connect:**
+• Submitting and tracking community reports
+• Checking system statistics and analytics
+• Understanding user roles and permissions
+• Navigating the application
+• Finding information about workers and assignments
+
+**General Knowledge:**
+• Science, technology, and mathematics
+• History, geography, and culture
+• Health, fitness, and wellness
+• Education and learning
+• Business and career advice
+• Arts, entertainment, and sports
+• Personal development and productivity
+• Current events and news concepts
+• Philosophy, ethics, and critical thinking
+
+**Practical Help:**
+• Answering questions about various topics
+• Explaining complex concepts simply
+• Providing study and learning tips
+• Offering advice on personal growth
+• Discussing ideas and perspectives
+
+What would you like to explore today?`;
+    }
+    
+    // Time and dates
+    if (input.includes('time') || input.includes('date') || input.includes('when')) {
+      if (input.includes('now') || input.includes('current')) {
+        return `The current time is ${new Date().toLocaleTimeString()} on ${new Date().toLocaleDateString()}. I can also help you understand time zones, historical timelines, or temporal concepts.`;
+      }
+      return 'Time is a fundamental concept that helps us sequence events and measure duration. I can discuss time management, historical periods, or temporal concepts in various contexts.';
+    }
+    
+    // Default intelligent responses for general questions
+    const generalResponses = [
+      'That\'s an interesting question! I can provide information on many topics. Could you tell me more about what you\'d like to know?',
+      'I\'m here to help with both Community Connect features and general knowledge questions. What specific area interests you?',
+      'I can assist with a wide range of topics from science and technology to arts and culture. What would you like to explore?',
+      'I\'m designed to be a versatile AI assistant. Feel free to ask me about Community Connect or any general topic you\'re curious about.',
+      'I can help with practical questions, explain concepts, or discuss ideas. What\'s on your mind today?'
+    ];
+    
+    return generalResponses[Math.floor(Math.random() * generalResponses.length)];
   };
 
   const handleWorkerRegister = async (e) => {
@@ -555,7 +900,47 @@ const App = () => {
     }
   };
 
+  const canDeleteReport = (report) => {
+    // Admin can delete any report
+    if (userRole === 'admin' || authenticatedAdmin) return true;
+    
+    // Report creator can delete their own report
+    if (user && report.reporterEmail === user.email) return true;
+    
+    // Assigned worker can delete the report
+    if (authenticatedWorker && report.assignedTo === authenticatedWorker.email) return true;
+    
+    // Worker logged in with user account can delete assigned reports
+    if (user && report.assignedTo === user.email) return true;
+    
+    return false;
+  };
+
+  const canResolveReport = (report) => {
+    if (!user && !authenticatedAdmin) return false;
+    
+    // Admin can resolve any report
+    if (userRole === 'admin' || authenticatedAdmin) return true;
+    
+    // Report creator can resolve their own report
+    if (user && report.reporterEmail === user.email) return true;
+    
+    return false;
+  };
+
   const handleDeleteReport = async (reportId) => {
+    // Find the report to check permissions
+    const report = reports.find(r => r.id === reportId);
+    if (!report) {
+      alert('Report not found');
+      return;
+    }
+    
+    if (!canDeleteReport(report)) {
+      alert('You do not have permission to delete this report. Only the reporter, assigned worker, and admin can delete reports.');
+      return;
+    }
+    
     if (!window.confirm('Are you sure you want to delete this report?')) {
       return;
     }
@@ -594,16 +979,37 @@ const App = () => {
       
       await updateDoc(reportRef, updateData);
       
-      // Update worker stats
+      // Update worker stats and rating
       if (action === 'resolved') {
         const workerRef = doc(db, 'workers', authenticatedWorker.id);
+        const newCompletedReports = (authenticatedWorker.completedReports || 0) + 1;
+        
+        // Calculate new rating based on performance
+        const newRating = calculateWorkerRating(newCompletedReports, authenticatedWorker.assignedReports || 0);
+        
         await updateDoc(workerRef, {
-          completedReports: (authenticatedWorker.completedReports || 0) + 1
+          completedReports: newCompletedReports,
+          rating: newRating
         });
       }
       
       fetchReports();
       fetchAnalytics();
+      fetchWorkers(); // Refresh workers data to show updated ratings
+      
+      // Update authenticated worker data if this is the current worker
+      if (authenticatedWorker && authenticatedWorker.id === reportId) {
+        const updatedWorker = { ...authenticatedWorker };
+        if (action === 'resolved') {
+          updatedWorker.completedReports = (authenticatedWorker.completedReports || 0) + 1;
+          updatedWorker.rating = calculateWorkerRating(
+            updatedWorker.completedReports,
+            authenticatedWorker.assignedReports || 0
+          );
+        }
+        setAuthenticatedWorker(updatedWorker);
+      }
+      
       alert(`Report ${action} successfully!`);
     } catch (error) {
       console.error('Error updating report:', error);
@@ -770,6 +1176,18 @@ const App = () => {
   };
 
   const deleteReport = async (reportId) => {
+    // Find the report to check permissions
+    const report = reports.find(r => r.id === reportId);
+    if (!report) {
+      console.error('Report not found');
+      return;
+    }
+    
+    if (!canDeleteReport(report)) {
+      alert('You do not have permission to delete this report. Only the reporter, assigned worker, and admin can delete reports.');
+      return;
+    }
+    
     try {
       await deleteDoc(doc(db, 'reports', reportId));
       fetchReports();
@@ -1124,7 +1542,7 @@ const App = () => {
                   Submit Issue
                 </button>
                 <button
-                  onClick={() => {}}
+                  onClick={handleBrowseReports}
                   className="bg-orange-600 text-white px-6 py-3 rounded-lg font-semibold hover:bg-orange-700 transition-colors duration-200"
                 >
                   <Eye className="h-5 w-5 inline mr-2" />
@@ -1291,21 +1709,43 @@ const App = () => {
                       <div className="flex items-center justify-between pt-3 border-t border-gray-700">
                         <div className="flex items-center space-x-4 text-xs text-gray-400">
                           <span>Completed: {worker.completedReports || 0}</span>
-                          <div className="flex items-center space-x-1">
-                            <span>Rating:</span>
-                            <div className="flex items-center">
-                              {[...Array(5)].map((_, i) => (
-                                <Star
-                                  key={i}
-                                  className={`h-3 w-3 ${
-                                    i < (worker.rating || 0)
-                                      ? 'text-yellow-400 fill-current'
-                                      : 'text-gray-600'
-                                  }`}
-                                />
-                              ))}
-                              <span className="ml-1 text-xs font-medium">{worker.rating || 'N/A'}</span>
+                          <div className="flex flex-col space-y-1">
+                            <div className="flex items-center space-x-1">
+                              <span className="text-blue-400">Performance:</span>
+                              <div className="flex items-center">
+                                {[...Array(5)].map((_, i) => (
+                                  <Star
+                                    key={i}
+                                    className={`h-3 w-3 ${
+                                      i < (worker.rating || 0)
+                                        ? 'text-blue-400 fill-current'
+                                        : 'text-gray-600'
+                                    }`}
+                                  />
+                                ))}
+                                <span className="ml-1 text-xs font-medium text-blue-400">{worker.rating || 'N/A'}</span>
+                              </div>
                             </div>
+                            {worker.userRating && (
+                              <div className="flex items-center space-x-1">
+                                <span className="text-yellow-400">Users:</span>
+                                <div className="flex items-center">
+                                  {[...Array(5)].map((_, i) => (
+                                    <Star
+                                      key={i}
+                                      className={`h-3 w-3 ${
+                                        i < Math.floor(worker.userRating)
+                                          ? 'text-yellow-400 fill-current'
+                                          : 'text-gray-600'
+                                      }`}
+                                    />
+                                  ))}
+                                  <span className="ml-1 text-xs font-medium text-yellow-400">
+                                    {worker.userRating} ({worker.totalRatings || 0})
+                                  </span>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1319,6 +1759,13 @@ const App = () => {
                       <button className="flex-1 px-3 py-2 bg-gray-600 text-white text-sm rounded-lg hover:bg-gray-700 transition-colors">
                         <Mail className="h-4 w-4 inline mr-1" />
                         Message
+                      </button>
+                      <button 
+                        onClick={() => openRatingModal(worker)}
+                        className="flex-1 px-3 py-2 bg-yellow-600 text-white text-sm rounded-lg hover:bg-yellow-700 transition-colors"
+                      >
+                        <Star className="h-4 w-4 inline mr-1" />
+                        Rate
                       </button>
                     </div>
                   </div>
@@ -1579,28 +2026,34 @@ const App = () => {
                   <h2 className="text-lg font-semibold text-gray-800">Report Locations</h2>
                 </div>
                 <div className="p-6">
-                  <GoogleMap
-                    mapContainerStyle={mapContainerStyle}
-                    center={center}
-                    zoom={12}
-                    onClick={handleMapClick}
-                    onLoad={map => mapRef.current = map}
-                  >
-                    {reports.map(report => (
-                      <Marker
-                        key={report.id}
-                        position={report.location}
-                        onClick={() => { setSelectedReport(report); setShowReportDetails(true); }}
-                      />
-                    ))}
-                  </GoogleMap>
+                  {loadError ? (
+                    <FallbackMap />
+                  ) : isLoaded ? (
+                    <GoogleMap
+                      mapContainerStyle={mapContainerStyle}
+                      center={center}
+                      zoom={12}
+                      onClick={handleMapClick}
+                      onLoad={map => mapRef.current = map}
+                    >
+                      {reports.map(report => (
+                        <Marker
+                          key={report.id}
+                          position={report.location}
+                          onClick={() => { setSelectedReport(report); setShowReportDetails(true); }}
+                        />
+                      ))}
+                    </GoogleMap>
+                  ) : (
+                    <div className="bg-gray-200 rounded-lg flex items-center justify-center" style={{ height: '400px' }}>
+                      <p className="text-gray-600">Loading map...</p>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
           </div>
         )}
-
-        {/* Reports Tab */}
         {activeTab === 'reports' && (
           <div className="space-y-6">
             {/* Filters and Search */}
@@ -1767,12 +2220,14 @@ const App = () => {
                           </button>
                         )}
                         
-                        <button
-                          onClick={() => deleteReport(report.id)}
-                          className="p-2 text-gray-400 hover:text-red-600 transition-colors"
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </button>
+                        {canDeleteReport(report) && (
+                          <button
+                            onClick={() => deleteReport(report.id)}
+                            className="p-2 text-gray-400 hover:text-red-600 transition-colors"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -2355,13 +2810,15 @@ const App = () => {
                           <p className="text-gray-400 text-sm">{report.status} | {report.priority}</p>
                         </div>
                       </div>
-                      <button
-                        onClick={() => handleDeleteReport(report.id)}
-                        className="px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700 transition-colors"
-                      >
-                        <Trash2 className="h-4 w-4 inline mr-1" />
-                        Delete
-                      </button>
+                      {canDeleteReport(report) && (
+                        <button
+                          onClick={() => handleDeleteReport(report.id)}
+                          className="px-3 py-1 bg-red-600 text-white text-sm rounded hover:bg-red-700 transition-colors"
+                        >
+                          <Trash2 className="h-4 w-4 inline mr-1" />
+                          Delete
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -2750,18 +3207,27 @@ const App = () => {
               <MessageSquare className="h-5 w-5" />
               <span className="font-semibold">AI Assistant</span>
             </div>
-            <button
-              onClick={() => setShowChatbot(false)}
-              className="p-1 hover:bg-green-700 rounded transition-colors"
-            >
-              <X className="h-4 w-4" />
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={clearChat}
+                className="p-1 hover:bg-green-700 rounded transition-colors"
+                title="Clear chat"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </button>
+              <button
+                onClick={() => setShowChatbot(false)}
+                className="p-1 hover:bg-green-700 rounded transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
           
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
             {chatbotMessages.map(message => (
               <div key={message.id} className={`flex ${message.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-xs px-4 py-2 rounded-lg ${
+                <div className={`max-w-md lg:max-w-lg px-4 py-2 rounded-lg ${
                   message.sender === 'user' 
                     ? 'bg-blue-600 text-white' 
                     : 'bg-gray-100 text-gray-800'
@@ -2893,7 +3359,9 @@ const App = () => {
                     {showLocationPicker ? 'Hide Map' : 'Show Map'}
                   </button>
                 </label>
-                {showLocationPicker && isLoaded && (
+                {showLocationPicker && (loadError ? (
+                  <FallbackMap />
+                ) : isLoaded ? (
                   <div className="h-64 rounded-lg overflow-hidden border border-gray-300">
                     <GoogleMap
                       mapContainerStyle={{ width: '100%', height: '100%' }}
@@ -2908,7 +3376,11 @@ const App = () => {
                       )}
                     </GoogleMap>
                   </div>
-                )}
+                ) : (
+                  <div className="bg-gray-200 rounded-lg flex items-center justify-center h-64">
+                    <p className="text-gray-600">Loading map...</p>
+                  </div>
+                ))}
               </div>
 
               <div>
@@ -3173,7 +3645,7 @@ const App = () => {
               </div>
 
               <div className="flex justify-end space-x-4">
-                {selectedReport.status !== 'resolved' && (
+                {selectedReport.status !== 'resolved' && canResolveReport(selectedReport) && (
                   <button
                     onClick={() => {
                       updateReportStatus(selectedReport.id, 'resolved');
@@ -3184,14 +3656,98 @@ const App = () => {
                     Mark as Resolved
                   </button>
                 )}
+                {canDeleteReport(selectedReport) && (
+                  <button
+                    onClick={() => {
+                      deleteReport(selectedReport.id);
+                      setShowReportDetails(false);
+                    }}
+                    className="px-6 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+                  >
+                    Delete Report
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* User Rating Modal */}
+      {showRatingModal && selectedWorkerForRating && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full">
+            <div className="p-6 border-b border-gray-200">
+              <div className="flex items-center justify-between">
+                <h2 className="text-xl font-semibold text-gray-800">Rate Worker</h2>
                 <button
-                  onClick={() => {
-                    deleteReport(selectedReport.id);
-                    setShowReportDetails(false);
-                  }}
-                  className="px-6 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+                  onClick={() => setShowRatingModal(false)}
+                  className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
                 >
-                  Delete Report
+                  <X className="h-5 w-5 text-gray-500" />
+                </button>
+              </div>
+            </div>
+            
+            <div className="p-6">
+              <div className="flex items-center space-x-3 mb-4">
+                <div className="w-12 h-12 bg-green-600 rounded-full flex items-center justify-center">
+                  <User className="h-6 w-6 text-white" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-gray-800">{selectedWorkerForRating.name}</h3>
+                  <p className="text-sm text-gray-500">{selectedWorkerForRating.workType || selectedWorkerForRating.department}</p>
+                </div>
+              </div>
+              
+              <div className="mb-6">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Your Rating</label>
+                <div className="flex justify-center space-x-2">
+                  {[1, 2, 3, 4, 5].map((rating) => (
+                    <button
+                      key={rating}
+                      onClick={() => setUserRating(rating)}
+                      className="p-2 transition-transform hover:scale-110"
+                    >
+                      <Star
+                        className={`h-8 w-8 ${
+                          rating <= userRating
+                            ? 'text-yellow-400 fill-current'
+                            : 'text-gray-300'
+                        }`}
+                      />
+                    </button>
+                  ))}
+                </div>
+                <p className="text-center text-sm text-gray-500 mt-2">
+                  {userRating === 0 ? 'Select a rating' : `${userRating} star${userRating > 1 ? 's' : ''}`}
+                </p>
+              </div>
+              
+              <div className="mb-6">
+                <label className="block text-sm font-medium text-gray-700 mb-2">Comment (Optional)</label>
+                <textarea
+                  value={ratingComment}
+                  onChange={(e) => setRatingComment(e.target.value)}
+                  placeholder="Share your experience with this worker..."
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent resize-none"
+                  rows={3}
+                />
+              </div>
+              
+              <div className="flex space-x-3">
+                <button
+                  onClick={() => setShowRatingModal(false)}
+                  className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleUserRating}
+                  disabled={userRating === 0}
+                  className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  Submit Rating
                 </button>
               </div>
             </div>
